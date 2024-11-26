@@ -22,7 +22,10 @@ class ApiConstruct(Construct):
         architecture: _lambda.Architecture,
         runtime: _lambda.Runtime,
         max_tokens: str,
-        temperature: str
+        temperature: str,
+        num_search_results: str,
+        rag_model_name: str,
+        knowledge_base_id: str
     ):
         super().__init__(scope, id)
 
@@ -113,7 +116,10 @@ class ApiConstruct(Construct):
                 "CHAT_HISTORY_TABLE_NAME": chat_history_dynamodb_table.table_name,
                 "REGION": Aws.REGION,
                 "DEFAULT_MAX_TOKENS": max_tokens,
-                "DEFAULT_TEMPERATURE": temperature
+                "DEFAULT_TEMPERATURE": temperature,
+                "NUM_SEARCH_RESULTS": num_search_results,
+                "RAG_MODEL_NAME": rag_model_name,
+                "KNOWLEDGE_BASE_ID": knowledge_base_id
             },
         )
 

@@ -38,6 +38,9 @@ class GateAgentBeStack(Stack):
         # Get values from config
         max_tokens = str(config["model"]["max_tokens"])
         temperature = str(config["model"]["temperature"])
+        num_search_results = str(config["rag"]["num_search_results"])
+        rag_model_name = str(config["rag"]["rag_model_name"])
+        knowledge_base_id = str(config["rag"]["knowledge_base_id"])
 
         ## **************** Lambda Layers ****************
         self.layers = LambdaLayers(
@@ -57,5 +60,8 @@ class GateAgentBeStack(Stack):
             architecture=architecture,
             runtime=python_runtime,
             max_tokens=max_tokens,
-            temperature=temperature
+            temperature=temperature,
+            num_search_results=num_search_results,
+            rag_model_name=rag_model_name,
+            knowledge_base_id=knowledge_base_id
         )

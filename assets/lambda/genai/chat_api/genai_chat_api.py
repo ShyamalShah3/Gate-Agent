@@ -15,9 +15,13 @@ from model.streaming import StreamingCallback
 from utils.enums import (
     FunctionResponseFields as funb,
     WebSocketMessageFields as wssm,
+    BedrockModel
 )
 from factories.provider_factory import ProviderFactory
 from functools import lru_cache
+from langchain_aws import AmazonKnowledgeBasesRetriever, ChatBedrock
+from langchain.retrievers.multi_query import MultiQueryRetriever
+
 
 # Set up logging
 LOGGER = logging.getLogger(__name__)
@@ -56,9 +60,45 @@ def extract_event_data(event: Dict[str, Any]) -> tuple:
     model_name = body.get('model_name', 'CLAUDE_3_5_SONNET')  # Default model
     max_tokens = int(body.get('max_tokens', os.environ.get('DEFAULT_MAX_TOKENS', 1000)))
     temperature = float(body.get('temperature', os.environ.get('DEFAULT_TEMPERATURE', 0.7)))
+    region = str(os.environ.get('REGION', 'us-west-2'))
+    rag_model_name = str(os.environ.get('RAG_MODEL_NAME', 'CLAUDE_3_5_HAIKU'))
+    knowledge_base_id = str(os.environ.get('KNOWLEDGE_BASE_ID'))
+    num_search_results = int(os.environ.get('NUM_SEARCH_RESULTS', 5))
     
-    LOGGER.debug(f"Extracted event data: session_id={session_id}, user_input={user_input}, model_name={model_name}, max_tokens={max_tokens}, temperature={temperature}")
-    return body, session_id, user_input, model_name, max_tokens, temperature
+    LOGGER.debug(f"Extracted event data: session_id={session_id}, user_input={user_input}, model_name={model_name}, max_tokens={max_tokens}, temperature={temperature}, region={region}, rag_model_name={rag_model_name}, knowledge_base_id={knowledge_base_id}, num_search_results={num_search_results}")
+    return body, session_id, user_input, model_name, max_tokens, temperature, region, rag_model_name, knowledge_base_id, num_search_results
+
+def get_multi_query_retriever(region: str, rag_model_name: str, knowledge_base_id: str, num_search_results: int) -> MultiQueryRetriever:
+    # Initialize Bedrock Client
+    rag_client = boto3.client('bedrock-runtime', region_name=region)
+
+    # Initialize RAG LLM
+    rag_llm = ChatBedrock(
+        client=rag_client,
+        model_id=BedrockModel[rag_model_name].value,
+        model_kwargs={
+            "temperature": 0
+        }
+    )
+
+    # Initialize Bedrock Knowledge Base Retriever
+    kb_retriever = AmazonKnowledgeBasesRetriever(
+        knowledge_base_id=knowledge_base_id,
+            retrieval_config={
+                "vectorSearchConfiguration": {
+                    "numberOfResults": num_search_results
+                }
+            },
+    )
+
+    # Initialize Multi Query Retriever
+    multi_query_retriever = MultiQueryRetriever.from_llm(
+        retriever=kb_retriever, 
+        llm=rag_llm
+    )
+
+    LOGGER.debug(f"Initialized Multi Query Retriever: region={region}, rag_model_name={rag_model_name}, knowledge_base_id={knowledge_base_id}, num_search_results={num_search_results}")
+    return multi_query_retriever
 
 
 def attach_websocket_publisher(event: Dict[str, Any], message_service: MessageDeliveryService) -> None:
@@ -117,7 +157,7 @@ def get_prompt_template() -> ChatPromptTemplate:
         ChatPromptTemplate: The chat prompt template.
     """
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful AI assistant."),
+        ("system", "You are a helpful AI assistant. Use the following context to answer the question.\n\nContext: {context}"),
         MessagesPlaceholder(variable_name="history"),
         ("human", "{input}"),
     ])
@@ -161,7 +201,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         # Extract data from the event
         LOGGER.debug(f"Received event: {event}")
-        body, session_id, user_input, model_name, max_tokens, temperature  = extract_event_data(event)
+        body, session_id, user_input, model_name, max_tokens, temperature, region, rag_model_name, knowledge_base_id, num_search_results  = extract_event_data(event)
+
+        # Initialize MultiQueryRetriever
+        multi_query_retriever = get_multi_query_retriever(region, rag_model_name, knowledge_base_id, num_search_results)
 
         # Attach WebSocketPublisher if available
         attach_websocket_publisher(event, message_service)
@@ -176,10 +219,26 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         prompt = get_prompt_template()
 
         if streaming_callback:
-            chain = (prompt | llm).with_config(callbacks=[streaming_callback])
+            chain = (
+                {
+                    "context": multi_query_retriever | (lambda docs: "\n\n".join(doc.page_content for doc in docs)),
+                    "input": lambda x: x["input"],
+                    "history": lambda x: x["history"]
+                }
+                | prompt
+                | llm
+            ).with_config(callbacks=[streaming_callback])
         else:
             # For non-streaming models
-            chain = (prompt | llm)
+            chain = (
+                {
+                    "context": multi_query_retriever | (lambda docs: "\n\n".join(doc.page_content for doc in docs)),
+                    "input": lambda x: x["input"],
+                    "history": lambda x: x["history"]
+                }
+                | prompt
+                | llm
+            )
 
         # Wrap the chain with message history and include callbacks
         chain_with_history = RunnableWithMessageHistory(
@@ -206,7 +265,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if streaming_callback:
             LOGGER.info(f"Starting to process user input for session_id: {session_id} with model: {model_name}")
             for _ in chain_with_history.stream(
-                {"input": user_input},
+                {"input": user_input, "history": []},
                 config={"configurable": {"session_id": session_id}}
             ):
                 pass  # The streaming_callback handles the message delivery
@@ -219,7 +278,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         else:
             # Handle non-streaming models
             LOGGER.info(f"Starting to process user input for session_id: {session_id} with model: {model_name}")
-            response = chain_with_history.run({"input": user_input}, config={"configurable": {"session_id": session_id}})
+            response = chain_with_history.run({"input": user_input, "history": []}, config={"configurable": {"session_id": session_id}})
             LOGGER.info("Response processing completed.")
             return {
                 funb.STATUS_CODE: 200,
